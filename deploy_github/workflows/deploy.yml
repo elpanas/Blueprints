@@ -1,4 +1,30 @@
-name: Deploy Rehab
+# =============================================================================
+# AutoCheckDeploy - GitHub Action
+# Copyright (c) 2025 Luca Panariello
+#
+# Licenza personale – Luca Panariello, 2025
+#
+# Tutti i diritti riservati.
+#
+# Questo software è fornito per uso personale, educativo e sperimentale.
+# Non è consentito utilizzarlo per scopi commerciali o redistribuirlo senza
+# il permesso scritto dell'autore.
+#
+# Permessi:
+# - Uso personale e test.
+# - Modifica del codice per uso personale.
+# - Condivisione delle modifiche citando l'autore.
+#
+# Divieti:
+# - Vendita o guadagno diretto dal software.
+# - Ridistribuzione senza citare l'autore.
+# - Uso commerciale senza permesso.
+#
+# Il software è fornito "così com'è", senza garanzie di alcun tipo. 
+# L'autore non è responsabile per eventuali danni derivanti dall'uso.
+# =============================================================================
+
+name: AutoCheckDeploy
 
 on:
   push:
