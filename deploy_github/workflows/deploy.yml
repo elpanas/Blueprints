@@ -1,0 +1,208 @@
+name: Deploy Rehab
+
+on:
+  push:
+    branches:
+      - main
+      - dev 
+      # aggiungi branches da monitorare
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code repository
+        uses: actions/checkout@v4 # scarica i file del deploy da github
+        
+      - name: Load configuration
+        id: config
+        run: | #shell
+          echo "=== Caricamento configurazione: $(date) ==="
+
+          # Carica il file di configurazione scaricato nello step precedente
+          source deploy.conf
+          
+          # Esporta le variabili su GITHUB ENV per i prossimi step
+          {
+            echo "APP_NAME=$APP_NAME"
+            echo "APP_PATH=$APP_PATH"
+            echo "SERVICES=$SERVICES"
+            echo "GIT_REPO=$GIT_REPO"
+            echo "VOLUMES=$VOLUMES"
+            echo "HEALTHCHECK_TIMEOUT=$HEALTHCHECK_TIMEOUT"
+          } >> $GITHUB_ENV
+
+      - name: Connetti via SSH e deploya
+        uses: appleboy/ssh-action@v0.1.10 # Action preconfezionata per la connessione SSH
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USERNAME }} # da creare sul server
+          key: ${{ secrets.SERVER_SSH_KEY }} # da caricare sul server
+          envs: APP_NAME,APP_PATH,SERVICES,GIT_REPO,VOLUMES,HEALTHCHECK_TIMEOUT
+          script: | #shell
+            set -e
+            echo "=== Deploy iniziato: $(date) ==="
+
+            ###########################################################################
+            # INIZIALIZZAZIONE
+            ###########################################################################
+            BRANCH="${{ github.ref_name }}" # main triggera su main o dev triggera su dev
+
+            # conversione stringa in lista Es.: "backend" "frontend"
+            IFS=',' read -ra SERVICES <<< "$SERVICES"
+            IFS=',' read -ra VOLUMES <<< "$VOLUMES"
+
+            # percorso di lavoro
+            cd "$APP_PATH"
+
+            # percorso di log e backup
+            mkdir -p logs backups
+
+            # file di log
+            LOGFILE="logs/deploy_$(date +%Y%m%d_%H%M%S).log"
+            
+
+            ###########################################################################
+            # FUNZIONI
+            ###########################################################################
+
+            # FUNZIONE PER ROLLBACK
+            rollback() {
+              set +e  # disabilita set -e dentro la funzione
+              local SERVICE=$1 SVC_IMAGE=$2 ROLLBACK_IMAGE=$3 CONTAINER=$4
+
+              echo "Errore $SERVICE. Ecco gli ultimi 50 log:"
+
+              # Mostra gli ultimi 50 log
+              docker logs --tail 50 "$CONTAINER" || true
+
+              # Salva tutto il log in un file separato
+              LOG_FULL="logs/${SERVICE}_full_$(date +%Y%m%d_%H%M%S).log"
+              docker logs --tail 500 "$CONTAINER" &> "$LOG_FULL" || true
+              echo "Log completo di $SERVICE salvato in $LOG_FULL"
+
+              echo "=== Rollback di $SERVICE in corso ==="
+              # Rinomina l’immagine precedente
+              docker tag "$ROLLBACK_IMAGE" "$SVC_IMAGE:latest"
+
+              # Riavvia tutti i container
+              docker compose up -d
+              echo "Immagine $SERVICE precedente ripristinata"
+              exit 1
+              set -e  # abilita set -e dentro la funzione
+            }
+            
+            # FUNZIONE PER HEALTHCHECK
+            wait_for_health() {
+              local SERVICE=$1 CONTAINER=$2
+              local TIMEOUT=${HEALTHCHECK_TIMEOUT:-60} ELAPSED=0
+
+              while [ $ELAPSED -lt $TIMEOUT ]; do
+                  local STATUS=$(docker inspect -f '{{.State.Health.Status}}' "$CONTAINER" 2>/dev/null || echo "none")
+                  
+                  case "$STATUS" in
+                      "healthy")   echo "$SERVICE healthy"; return 0 ;;
+                      "unhealthy") echo "$SERVICE unhealthy"; return 1 ;;
+                  esac
+                  
+                  sleep 2
+                  ELAPSED=$((ELAPSED + 2))
+              done
+
+              echo "TIMEOUT: $SERVICE dopo ${TIMEOUT}s"
+              return 1
+            }
+
+            ###########################################################################
+            # 1) BACKUP VOLUME shared_data
+            ###########################################################################
+            # 0. esegue un container rimovibile alpine in cui:
+            # 1. monta il volume shared_data da backuppare dentro la dir /volume
+            # 2. monta la cartella di backup sul server
+            # 3. esegue il backup compresso della cartella /volume
+            # 4. scrive nel terminale e nel log
+            echo "--- Backup volumi ---"
+            for VOLUME in "${VOLUMES[@]}"; do
+              echo "Backup volume: $VOLUME"
+
+              BACKUP_FILE="$VOLUME.tar.gz"
+
+              if docker run --rm \
+                -v "$VOLUME":/volume \
+                -v "$APP_PATH/backups":/backup \
+                alpine sh -c "tar -czf /backup/$BACKUP_FILE -C /volume . 2>/dev/null"; then
+                echo "Backup $VOLUME completato"
+              else
+                echo "Backup $VOLUME fallito"
+              fi
+            done | tee -a "$LOGFILE"
+
+            ###########################################################################
+            # 2) BACKUP IMMAGINI DEI SERVIZI PER ROLLBACK
+            ###########################################################################
+            for SERVICE in "${SERVICES[@]}"; do
+              SVC_IMAGE="$APP_NAME-$SERVICE" # immagine corrente
+              ROLLBACK_IMAGE="${SVC_IMAGE}_rollback" # immagine di rollback
+
+              echo "--- Preparazione immagine rollback $SERVICE ---"
+              if docker image inspect "$SVC_IMAGE:latest" >/dev/null 2>&1; then # se l'immagine esiste
+                docker tag "$SVC_IMAGE:latest" "$ROLLBACK_IMAGE" # la tagga/rinomina come rollback
+                echo "Immagine $SERVICE salvata come $ROLLBACK_IMAGE"
+              else
+                echo "Nessuna immagine $SERVICE precedente trovata"
+              fi 
+            done
+
+            ###########################################################################
+            # 3) AGGIORNA REPO
+            ###########################################################################
+            if [ ! -d ".git" ]; then
+              git clone -b "$BRANCH" "$GIT_REPO" . | tee -a "$LOGFILE"
+            else
+              git fetch origin "$BRANCH"
+              git checkout "$BRANCH" || git checkout -b "$BRANCH" origin/"$BRANCH"
+              git reset --hard origin/"$BRANCH" | tee -a "$LOGFILE" # reset e non pull per evitare HEAD sbagliati
+            fi
+
+            ###########################################################################
+            # 4) STOP vecchi container
+            ###########################################################################
+            docker compose down || true
+
+            ###########################################################################
+            # 5) BUILD + AVVIO NUOVI CONTAINER
+            ###########################################################################
+            echo "--- Docker compose up (build) ---"
+            docker compose up --build -d | tee -a "$LOGFILE"
+            
+            # Check riavvii
+            for SERVICE in "${SERVICES[@]}"; do
+              SVC_IMAGE="$APP_NAME-$SERVICE" # immagine corrente
+              ROLLBACK_IMAGE="${SVC_IMAGE}_rollback" # immagine di rollback
+              CONTAINER=$(docker compose ps -q "$SERVICE")  # prende l'ID del container
+              RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$CONTAINER") # conta i riavvii
+
+              # se intercetta un ERR nel ciclo, esegue rollback per il container corrente
+              trap 'rollback "$SERVICE" "$SVC_IMAGE" "$ROLLBACK_IMAGE" "$CONTAINER"' ERR
+
+              # se il container ha problemi effettua un rollback
+              if [ "$RESTARTS" -gt 0 ]; then
+                echo "$SERVICE ha avuto $RESTARTS riavvii"
+                rollback "$SERVICE" "$SVC_IMAGE" "$ROLLBACK_IMAGE" "$CONTAINER"  
+              fi
+
+              # se il container non risponde dopo il timeout, esegue rollback
+              if ! wait_for_health "$SERVICE" "$CONTAINER"; then                  
+                rollback "$SERVICE" "$SVC_IMAGE" "$ROLLBACK_IMAGE" "$CONTAINER"                
+              fi
+              echo "--- Log di $SERVICE ---"
+              docker logs --tail 50 "$CONTAINER" || true
+            done
+
+            ###########################################################################
+            # 6) DEPLOY OK
+            ###########################################################################
+            echo "--- Deploy completato con successo, rollback precedente conservato ---"
+            echo "=== Deploy completato: $(date) ==="
+
+
