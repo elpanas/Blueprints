@@ -114,14 +114,18 @@ jobs:
             }
 
             ###########################################################################
-            # 1) BACKUP VOLUME shared_data
+            # 1) BACKUP VOLUMI
             ###########################################################################
             # 0. esegue un container rimovibile alpine in cui:
-            # 1. monta il volume shared_data da backuppare dentro la dir /volume
+            # 1. monta il volume da backuppare dentro la dir /volume
             # 2. monta la cartella di backup sul server
             # 3. esegue il backup compresso della cartella /volume
             # 4. scrive nel terminale e nel log
             echo "--- Backup volumi ---"
+            if [ ${#VOLUMES[@]} -eq 0 ]; then
+              echo "Nessun volume da backuppare"
+            fi
+
             for VOLUME in "${VOLUMES[@]}"; do
               echo "Backup volume: $VOLUME"
 
@@ -204,5 +208,3 @@ jobs:
             ###########################################################################
             echo "--- Deploy completato con successo, rollback precedente conservato ---"
             echo "=== Deploy completato: $(date) ==="
-
-
