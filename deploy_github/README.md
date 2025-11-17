@@ -1,4 +1,4 @@
-# Deploy Rehab
+# Deploy automatico
 
 Questo repository contiene uno **script di deploy automatizzato** per applicazioni containerizzate con Docker Compose. Lo script aggiorna l'applicazione su un server remoto via SSH, con backup automatici e possibilità di rollback in caso di errori.
 
