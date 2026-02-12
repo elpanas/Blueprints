@@ -57,7 +57,7 @@ The deployment process follows these main steps:
 
 ## Main Variables (`deploy.conf`)
 
-| Variable             | Description | Example |
+| Variables            | Description | Example |
 |----------------------|-------------|---------------------------|
 | `APP_NAME`           | Name of the application | your-app |
 | `APP_PATH`           | Path on the server where the project is located | /srv/your-app |
@@ -65,6 +65,12 @@ The deployment process follows these main steps:
 | `GIT_REPO`           | SSH URL of the repository | git@github.com:username/repo.git |
 | `VOLUMES`            | List of Docker volumes to backup, comma-separated | volume1,volume2 |
 | `HEALTHCHECK_TIMEOUT`| Timeout in seconds for container health checks | 60 |
+| `COMPOSENAME`        | Name of the Docker Compose file | docker-compose.yml |
+| `COMPOSENAME_DEV`    | Name of the Docker Compose dev file | docker-compose.dev.yml |
+| `APP_NAME_DEV`        | Name of the dev application | your-app_dev |
+| `APP_PATH_DEV`       | Path on the server where the dev project is located | /srv/your-app_dev |
+| `SERVICES_DEV`       | List of Docker Compose dev services, comma-separated | backend_dev,frontend_dev |
+| `VOLUMES_DEV`        | List of Docker dev volumes to backup, comma-separated | volume1_dev,volume2_dev |
 
 ---
 
