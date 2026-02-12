@@ -1,0 +1,75 @@
+services:
+  init-volume_dev: # temporary service for creating subfolders
+    image: alpine
+    command: | #shell      
+      mkdir -p /shared_data_dev/subdir1 /shared_data_dev/subdir2 &&
+      addgroup -g 1000 appgroup &&
+      adduser -D -u 1000 -G appgroup appuser &&
+      adduser -D -u 1001 -G appgroup nodeuser &&
+      chown -R 1000:1000 /shared_data_dev &&
+      chmod -R 775 /shared_data_dev &&
+      chmod g+s /shared_data_dev     
+    volumes: 
+      - shared_data_dev:/shared_data_dev
+    networks:
+      - demonet_dev
+    restart: "no"
+
+  backend_dev:
+    build: ./backend
+    ports: # porte esposte IN:OUT 3001
+      - "3001:3001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    env_file:
+      - .env
+    volumes:
+      - shared_data_dev:/app/shared_data_dev
+    depends_on: # servizi da cui dipende e dopo cui si avvia
+      - init-volume_dev
+    networks: # rete condivisa
+      - demonet_dev
+    # extra_hosts:
+    #  - "host.docker.internal:host-gateway"
+    cpus: 0.5        # <- CPU limit
+    mem_limit: 512M  # <- RAM limit
+    pids_limit: 128
+    restart: unless-stopped # riavvia a meno che non stoppato manualmente
+
+  frontend_dev:
+    build: ./frontend
+    environment:
+      - APP_ENV=true
+    #ports:
+    #  - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    volumes:
+      - shared_data_dev:/app/shared_data_dev
+    depends_on:
+      - init-volume_dev
+    networks:
+      - demonet_dev
+    cpus: 1.0     
+    mem_limit: 1G 
+    pids_limit: 128
+    restart: unless-stopped
+
+volumes: # global volumes
+  shared_data_dev:
+
+networks: 
+  kpnet_dev: # internal network
+    driver: bridge # containers can communicate with each other using the service name as hostname
+    ipam:
+      driver: default 
+      config:
+        - subnet: 172.19.0.0/16
