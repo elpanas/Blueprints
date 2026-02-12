@@ -1,0 +1,94 @@
+services:
+  init-volume: # temporary service for creating subfolders
+    image: alpine
+    command: | #shell      
+      mkdir -p /shared_data/subdir1 /shared_data/subdir2 &&
+      addgroup -g 1000 appgroup &&
+      adduser -D -u 1000 -G appgroup appuser &&
+      adduser -D -u 1001 -G appgroup nodeuser &&
+      chown -R 1000:1000 /shared_data &&
+      chmod -R 775 /shared_data &&
+      chmod g+s /shared_data     
+    volumes: 
+      - shared_data:/shared_data
+    networks:
+      - demonet
+    restart: "no"
+
+  backend:
+    build: ./backend
+    ports: # porte esposte IN:OUT
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    env_file:
+      - .env
+    volumes:
+      - shared_data:/app/shared_data
+    depends_on:
+      - init-volume
+    networks:
+      - demonet
+    # extra_hosts:
+    #  - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    #ports:
+    #  - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    volumes:
+      - shared_data:/app/shared_data
+    depends_on:
+      - init-volume
+    networks:
+      - demonet
+    restart: unless-stopped
+
+
+  caddy:
+    image: caddy:latest
+    cap_add:
+      - NET_ADMIN # needed for caddy to listen on port 443 UDP
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    volumes:
+      - ./config/caddy:/etc/caddy:ro # ro=read-only bind mount
+      - caddy_data:/data # certificati e chiavi
+      - caddy_config:/config # configurazione e stato
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      - backend
+    networks:
+      - demonet    
+    restart: unless-stopped
+
+volumes: # global volumes
+  shared_data:
+  caddy_data:
+  caddy_config: 
+
+networks: 
+  demonet: # internal network
+    driver: bridge # containers can communicate with each other using the service name as hostname
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.18.0.0/16
