@@ -26,95 +26,127 @@ on:
   push:
     branches:
       - main
-      - dev 
-      # aggiungi branches da monitorare
+      - dev
+  pull_request: # when it is a marge...
+    branches:
+      - main # on main branch (that is pull request main <- dev)
+    types:
+      - closed # and operation is complete
+  workflow_dispatch: # manual dev shutdown
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code repository
-        uses: actions/checkout@v4 # scarica i file del deploy da github
+        uses: actions/checkout@v4 # download files from repo
         
       - name: Load configuration
         id: config
         run: | #shell
           echo "=== Caricamento configurazione: $(date) ==="
 
-          # Carica il file di configurazione scaricato nello step precedente
+          # Load the deploy.conf file
           source deploy.conf
           
-          # Esporta le variabili su GITHUB ENV per i prossimi step
+          # Export variables for the following steps
           {
             echo "APP_NAME=$APP_NAME"
             echo "APP_PATH=$APP_PATH"
-            echo "SERVICES=$SERVICES"
+            echo "SERVICES=$SERVICES"            
             echo "GIT_REPO=$GIT_REPO"
             echo "VOLUMES=$VOLUMES"
             echo "HEALTHCHECK_TIMEOUT=$HEALTHCHECK_TIMEOUT"
+            echo "COMPOSENAME=$COMPOSENAME"
+            echo "BRANCH_NAME=$GITHUB_REF_NAME"
           } >> $GITHUB_ENV
 
+          # Load dev variables
+          if [ "${GITHUB_REF_NAME}" = "dev" ]; then
+            {
+              echo "APP_NAME_DEV=$APP_NAME_DEV"
+              echo "APP_PATH_DEV=$APP_PATH_DEV"
+              echo "SERVICES_DEV=$SERVICES_DEV"
+              echo "VOLUMES_DEV=$VOLUMES_DEV"
+              echo "COMPOSENAME_DEV=$COMPOSENAME_DEV"
+            } >> $GITHUB_ENV
+          fi
+
       - name: Connetti via SSH e deploya
-        uses: appleboy/ssh-action@v0.1.10 # Action preconfezionata per la connessione SSH
+        uses: appleboy/ssh-action@v0.1.10 # Action to connect via SSH
         with:
           host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USERNAME }} # da creare sul server
-          key: ${{ secrets.SERVER_SSH_KEY }} # da caricare sul server
-          envs: APP_NAME,APP_PATH,SERVICES,GIT_REPO,VOLUMES,HEALTHCHECK_TIMEOUT
+          username: ${{ secrets.SERVER_USERNAME }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_SSH_PORT }}
+          envs: BRANCH_NAME,APP_NAME,APP_PATH,SERVICES,GIT_REPO,VOLUMES,APP_PORT_PY,HEALTHCHECK_TIMEOUT,APP_NAME_DEV,APP_PATH_DEV,SERVICES_DEV,VOLUMES_DEV,COMPOSENAME,COMPOSENAME_DEV
           script: | #shell
             set -e
             echo "=== Deploy iniziato: $(date) ==="
 
             ###########################################################################
-            # INIZIALIZZAZIONE
+            # INIZIALIZATION
             ###########################################################################
-            BRANCH="${{ github.ref_name }}" # main triggera su main o dev triggera su dev
+            BRANCH="${BRANCH_NAME}"
 
-            # conversione stringa in lista Es.: "backend" "frontend"
+            # set variables based on branch
+            if [ "$BRANCH" = "dev" ]; then
+              APP_NAME="${APP_NAME_DEV}"
+              APP_PATH="${APP_PATH_DEV}"
+              SERVICES=(${SERVICES_DEV})
+              VOLUMES=(${VOLUMES_DEV})
+              COMPOSENAME=${COMPOSENAME_DEV}
+            fi
+
+            # convert string to array Es.: "backend" "frontend"
             IFS=',' read -ra SERVICES <<< "$SERVICES"
             IFS=',' read -ra VOLUMES <<< "$VOLUMES"
-
-            # percorso di lavoro
+            
+            # working directory
             cd "$APP_PATH"
 
-            # percorso di log e backup
+            # log, backup directory
             mkdir -p logs backups
 
-            # file di log
+            # log file
             LOGFILE="logs/deploy_$(date +%Y%m%d_%H%M%S).log"
             
 
             ###########################################################################
-            # FUNZIONI
+            # FUNCTIONS
             ###########################################################################
 
-            # FUNZIONE PER ROLLBACK
+            # Rollback functions
             rollback() {
-              set +e  # disabilita set -e dentro la funzione
+              set +e  # disable set -e inside the function
               local SERVICE=$1 SVC_IMAGE=$2 ROLLBACK_IMAGE=$3 CONTAINER=$4
 
               echo "Errore $SERVICE. Ecco gli ultimi 50 log:"
 
-              # Mostra gli ultimi 50 log
+              # Shows the last 50 logs
               docker logs --tail 50 "$CONTAINER" || true
 
-              # Salva tutto il log in un file separato
+              # Save the full logs in a timestamped file
               LOG_FULL="logs/${SERVICE}_full_$(date +%Y%m%d_%H%M%S).log"
               docker logs --tail 500 "$CONTAINER" &> "$LOG_FULL" || true
               echo "Log completo di $SERVICE salvato in $LOG_FULL"
 
               echo "=== Rollback di $SERVICE in corso ==="
-              # Rinomina l’immagine precedente
-              docker tag "$ROLLBACK_IMAGE" "$SVC_IMAGE:latest"
+              # Check if the rollback image exists
+              if docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1; then
+                  docker tag "$ROLLBACK_IMAGE" "$SVC_IMAGE:latest" # Rename the rollback image
+                  echo "Immagine $SERVICE precedente ripristinata"
+              else
+                  echo "Immagine di rollback $ROLLBACK_IMAGE non trovata, niente da ripristinare"
+              fi
 
-              # Riavvia tutti i container
-              docker compose up -d
-              echo "Immagine $SERVICE precedente ripristinata"
+              # Reboot every container
+              docker compose -f "$COMPOSENAME" up -d
               exit 1
-              set -e  # abilita set -e dentro la funzione
+              set -e  # Enable set -e after the function
             }
             
-            # FUNZIONE PER HEALTHCHECK
+            # Healthcheck function
             wait_for_health() {
               local SERVICE=$1 CONTAINER=$2
               local TIMEOUT=${HEALTHCHECK_TIMEOUT:-60} ELAPSED=0
@@ -136,13 +168,13 @@ jobs:
             }
 
             ###########################################################################
-            # 1) BACKUP VOLUMI
+            # 1) BACKUP VOLUMES
             ###########################################################################
-            # 0. esegue un container rimovibile alpine in cui:
-            # 1. monta il volume da backuppare dentro la dir /volume
-            # 2. monta la cartella di backup sul server
-            # 3. esegue il backup compresso della cartella /volume
-            # 4. scrive nel terminale e nel log
+            # 0. run a docker container alpine where it:
+            # 1. mounts the volume to backup inside dir /volume 
+            # 2. mounts backup dir on server
+            # 3. run a zipped backup of /volume dir
+            # 4. write in log and terminal
             echo "--- Backup volumi ---"
             if [ ${#VOLUMES[@]} -eq 0 ]; then
               echo "Nessun volume da backuppare"
@@ -164,15 +196,15 @@ jobs:
             done | tee -a "$LOGFILE"
 
             ###########################################################################
-            # 2) BACKUP IMMAGINI DEI SERVIZI PER ROLLBACK
+            # 2) BACKUP IMAGES FOR ROLLBACK
             ###########################################################################
             for SERVICE in "${SERVICES[@]}"; do
-              SVC_IMAGE="$APP_NAME-$SERVICE" # immagine corrente
-              ROLLBACK_IMAGE="${SVC_IMAGE}_rollback" # immagine di rollback
+              SVC_IMAGE="$APP_NAME-$SERVICE" # current image
+              ROLLBACK_IMAGE="${SVC_IMAGE}_rollback" # rollback image
 
               echo "--- Preparazione immagine rollback $SERVICE ---"
-              if docker image inspect "$SVC_IMAGE:latest" >/dev/null 2>&1; then # se l'immagine esiste
-                docker tag "$SVC_IMAGE:latest" "$ROLLBACK_IMAGE" # la tagga/rinomina come rollback
+              if docker image inspect "$SVC_IMAGE:latest" >/dev/null 2>&1; then # if image exists
+                docker tag "$SVC_IMAGE:latest" "$ROLLBACK_IMAGE" # tag/rename as rollback
                 echo "Immagine $SERVICE salvata come $ROLLBACK_IMAGE"
               else
                 echo "Nessuna immagine $SERVICE precedente trovata"
@@ -180,53 +212,97 @@ jobs:
             done
 
             ###########################################################################
-            # 3) AGGIORNA REPO
+            # 3) UPDATE REPO
             ###########################################################################
             if [ ! -d ".git" ]; then
-              git clone -b "$BRANCH" "$GIT_REPO" . | tee -a "$LOGFILE"
+                git init | tee -a "$LOGFILE"
+                git remote add origin "$GIT_REPO" | tee -a "$LOGFILE"
+                git fetch origin "$BRANCH" | tee -a "$LOGFILE"
+                git checkout -b "$BRANCH" FETCH_HEAD | tee -a "$LOGFILE"
             else
-              git fetch origin "$BRANCH"
-              git checkout "$BRANCH" || git checkout -b "$BRANCH" origin/"$BRANCH"
-              git reset --hard origin/"$BRANCH" | tee -a "$LOGFILE" # reset e non pull per evitare HEAD sbagliati
+                git fetch origin "$BRANCH" | tee -a "$LOGFILE"
+                git checkout "$BRANCH" | tee -a "$LOGFILE" || git checkout -b "$BRANCH" origin/"$BRANCH" | tee -a "$LOGFILE"
+                git reset --hard origin/"$BRANCH" | tee -a "$LOGFILE"
             fi
 
             ###########################################################################
-            # 4) STOP vecchi container
+            # 4) STOP old containers
             ###########################################################################
-            docker compose down || true
+            docker compose -f "$COMPOSENAME" down || true
 
             ###########################################################################
-            # 5) BUILD + AVVIO NUOVI CONTAINER
+            # 5) BUILD + BOOT NEW CONTAINERS
             ###########################################################################
             echo "--- Docker compose up (build) ---"
-            docker compose up --build -d | tee -a "$LOGFILE"
-            
-            # Check riavvii
-            for SERVICE in "${SERVICES[@]}"; do
-              SVC_IMAGE="$APP_NAME-$SERVICE" # immagine corrente
-              ROLLBACK_IMAGE="${SVC_IMAGE}_rollback" # immagine di rollback
-              CONTAINER=$(docker compose ps -q "$SERVICE")  # prende l'ID del container
-              RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$CONTAINER") # conta i riavvii
+            docker compose -f "$COMPOSENAME" up --build -d | tee -a "$LOGFILE"
 
-              # se intercetta un ERR nel ciclo, esegue rollback per il container corrente
+            # In case of error, uncomment the following lines to build without cache
+            # docker compose -f "$COMPOSENAME" build --no-cache | tee -a "$LOGFILE" && \
+            # docker compose -f "$COMPOSENAME" up -d | tee -a "$LOGFILE"
+
+            # Check reboots
+            for SERVICE in "${SERVICES[@]}"; do
+              SVC_IMAGE="$APP_NAME-$SERVICE" # current image
+              ROLLBACK_IMAGE="${SVC_IMAGE}_rollback" # rollback image
+              CONTAINER=$(docker compose -f "$COMPOSENAME" ps -q "$SERVICE")  # container ID
+              RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$CONTAINER") # reboots count
+
+              # if it intercepts ERR in the loop, execute rollback for the current container
               trap 'rollback "$SERVICE" "$SVC_IMAGE" "$ROLLBACK_IMAGE" "$CONTAINER"' ERR
 
-              # se il container ha problemi effettua un rollback
+              # if reboots count > 0, execute rollback
               if [ "$RESTARTS" -gt 0 ]; then
                 echo "$SERVICE ha avuto $RESTARTS riavvii"
                 rollback "$SERVICE" "$SVC_IMAGE" "$ROLLBACK_IMAGE" "$CONTAINER"  
               fi
-
-              # se il container non risponde dopo il timeout, esegue rollback
+              
+              # if container doesn't responde after timeouts, execute rollback.
               if ! wait_for_health "$SERVICE" "$CONTAINER"; then                  
                 rollback "$SERVICE" "$SVC_IMAGE" "$ROLLBACK_IMAGE" "$CONTAINER"                
               fi
               echo "--- Log di $SERVICE ---"
               docker logs --tail 50 "$CONTAINER" || true
             done
+            
+            ###########################################################################
+            # 6) CLEAN UP
+            ###########################################################################
+            docker image prune -f | tee -a "$LOGFILE" # remove unused images (not rollback images)
+            docker builder prune -f | tee -a "$LOGFILE" # remove unused build cache files
 
             ###########################################################################
-            # 6) DEPLOY OK
+            # 7) DEPLOY OK
             ###########################################################################
             echo "--- Deploy completato con successo, rollback precedente conservato ---"
-            echo "=== Deploy completato: $(date) ==="
+            echo "=== Deploy completato: $(date) ==="      
+
+  shutdown_dev: # Shutdown DEV environment
+    if: github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Load configuration
+        run: | #shell
+          echo "=== Caricamento configurazione dev: $(date) ==="
+          source deploy.conf
+          
+          {
+            echo "APP_NAME_DEV=$APP_NAME_DEV" 
+            echo "COMPOSENAME_DEV=$COMPOSENAME_DEV"
+          } >> $GITHUB_ENV
+
+      - name: Stop DEV environment
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USERNAME }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_SSH_PORT }}
+          envs: APP_NAME_DEV,COMPOSENAME_DEV
+          script: | #shell
+            echo "=== Spegnimento ambiente DEV ==="
+
+            cd /srv/$APP_NAME_DEV || exit 0
+            docker compose -f ${COMPOSENAME_DEV} down
+            echo "=== Ambiente DEV fermato ==="
+
+
